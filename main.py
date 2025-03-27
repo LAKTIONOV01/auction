@@ -9,6 +9,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 TOKEN = '7992178342:AAESfGo9dbybKJjjQ1iybphBLtHJyrSe0Uo'
 ADMIN_CHAT_ID = '7805766421'
 GROUP_ID = '-1002599159398'
+FINISH_GROUP_ID = '-1002591086307'
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -39,7 +40,9 @@ def init_db():
         bid_step REAL NOT NULL,
         current_bid REAL NOT NULL,
         start_time DATETIME NOT NULL,
-        end_time DATETIME NOT NULL,
+        duration DATETIME NOT NULL,
+        finished_notified BOOLEAN DEFAULT 0,
+        five_min_notified BOOLEAN DEFAULT 0,
         photo_link TEXT,
         video_link TEXT,
         autotheque_link TEXT,
@@ -72,6 +75,7 @@ def start_registration(message):
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
     existing_user = cursor.fetchone()
+    conn.close()
 
     if existing_user:
         bot.send_message(message.chat.id, "Вы уже зарегистрированы.")
@@ -85,7 +89,7 @@ def process_full_name(message):
     full_name = message.text
 
     # Сохранение данных о пользователе в БД
-    conn = sqlite3.connect('auction.db')
+    conn = sqlite3.connect('auction.db', timeout=10)
     cursor = conn.cursor()
     cursor.execute('INSERT INTO users (id, full_name) VALUES (?, ?)', (user_id, full_name))
     conn.commit()
@@ -112,8 +116,8 @@ def process_phone_number(message):
 
     # Запрос подтверждения
     markup = types.InlineKeyboardMarkup()
-    confirm_button = types.InlineKeyboardButton("Подтвердить", callback_data=f"confirm_{user_id}")
-    decline_button = types.InlineKeyboardButton("Отклонить", callback_data=f"decline_{user_id}")
+    confirm_button = types.InlineKeyboardButton("Подтвердить ✅", callback_data=f"confirm_{user_id}")
+    decline_button = types.InlineKeyboardButton("Отклонить ❌", callback_data=f"decline_{user_id}")
     markup.add(confirm_button, decline_button)
 
     bot.send_message(ADMIN_CHAT_ID, "Подтвердите или отклоните регистрацию:", reply_markup=markup)
@@ -232,7 +236,7 @@ def process_create_lot(message, title, description, town, starting_price, bid_st
 
     # Сохранение лота в базу данных
     cursor.execute('''
-    INSERT INTO lots (title, description, starting_price, bid_step, current_bid, start_time, end_time,
+    INSERT INTO lots (title, description, starting_price, bid_step, current_bid, start_time, duration,
                        photo_link, video_link, autotheque_link, user_id, town)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                    (title, description, starting_price, bid_step, starting_price,
@@ -243,6 +247,7 @@ def process_create_lot(message, title, description, town, starting_price, bid_st
                     autotheque_link, user_id, town))
 
     conn.commit()
+    conn.close()
 
     full_name = get_user_info(user_id)[0]
     phone = get_user_info(user_id)[1]
@@ -320,28 +325,26 @@ def get_time_left(start_time_str, end_time_minutes):
     end_time = start_time + timedelta(minutes=end_time_minutes)
     remaining = end_time - datetime.now()
 
-
-
     if remaining.total_seconds() <= 0:
-        return "Аукцион завершен"
+        return "Аукцион завершен", 0
 
     days, seconds = remaining.days, remaining.seconds
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
-    return f"{days}д {hours}ч {minutes}м"
+    return f"{days}д {hours}ч {minutes}м", remaining.total_seconds()
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('lot_'))
 def handle_lot_selection(call):
     lot_id = int(call.data.split('_')[1])
 
-    # Получаем информацию о лоте
     conn = sqlite3.connect('auction.db')
     cursor = conn.cursor()
     cursor.execute(
         '''SELECT lots.title, lots.description, lots.current_bid, 
-              lots.bid_step, lots.start_time, lots.end_time, lots.photo_link, 
-              lots.video_link, lots.autotheque_link, 
+              lots.bid_step, lots.start_time, lots.duration,
+              lots.five_min_notified, lots.finished_notified,
+              lots.photo_link, lots.video_link, lots.autotheque_link, 
               users.full_name, users.phone 
        FROM lots 
        JOIN users ON lots.user_id = users.id 
@@ -350,42 +353,30 @@ def handle_lot_selection(call):
     lot_info = cursor.fetchone()
 
     if lot_info:
-        title, description, current_bid, bid_step, start_time, end_time, photo_link, video_link, autotheque_link, full_name, phone = lot_info
+        (title, description, current_bid, bid_step, start_time, end_time,
+         five_min_notified, finished_notified, photo_link, video_link,
+         autotheque_link, full_name, phone) = lot_info
 
-        time_left = get_time_left(start_time, end_time)
+        time_left_str, remaining_seconds = get_time_left(start_time, end_time)
 
-        response_message = f"Лот: *{title}*\nОписание: {description}\nТекущая ставка: *{current_bid}₽*\nШаг ставки: {bid_step}₽\nВремя:{time_left}\nВладелец: {full_name} | {phone}"
+        # Если аукцион завершен
 
-        # Обновляем оставшееся время
+        response_message = f"Лот: *{title}*\nОписание: {description}\nТекущая ставка: *{current_bid}₽*\nШаг ставки: {bid_step}₽\nВремя: {time_left_str}\nВладелец: {full_name} | {phone}"
 
         markup = types.InlineKeyboardMarkup()
-        time_left_button = types.InlineKeyboardButton(text=f"🕒 Осталось: {time_left}",
-                                                      callback_data='time_refresh')
+        time_left_button = types.InlineKeyboardButton(
+            text=f"🕒 Осталось: {time_left_str}",
+            callback_data='time_refresh')
         markup.add(time_left_button)
 
-        # Кнопки для ставок
-        min_bid = current_bid + bid_step
-        button_place_bid = types.InlineKeyboardButton(text=f"Сделать ставку (мин. {min_bid}) ₽",
-                                                      callback_data=f'place_bid_{lot_id}_{min_bid}')
+        # Кнопки для ставок и медиа
+        # ... (ваш существующий код)
 
-        # Добавляем кнопки для фото и видео
-        if photo_link:
-            button_photo = types.InlineKeyboardButton(text="📸 Фото", url=photo_link)
-            button_autotheque = types.InlineKeyboardButton(text="📈 Автотека", url=autotheque_link)
-            markup.add(button_photo, button_autotheque)
+        msg = bot.send_photo(chat_id=call.message.chat.id, photo=photo_link,
+                             caption=response_message, reply_markup=markup)
 
-        if video_link:
-            button_video = types.InlineKeyboardButton(text="🎥 Видео", url=video_link)
-            markup.add(button_video)
-
-            # Добавляем кнопку для ставки
-            markup.add(button_place_bid)
-
-        msg = bot.send_photo(chat_id=call.message.chat.id, photo=photo_link, caption=response_message,
-                             reply_markup=markup)
-
-        # Запускаем обновление времени только если аукцион активен
-        if "завершен" not in time_left:
+        # Запуск обновления таймера
+        if remaining_seconds > 0:
             scheduler.add_job(
                 update_timer,
                 'interval',
@@ -394,24 +385,43 @@ def handle_lot_selection(call):
                 id=f'timer_{lot_id}_{msg.message_id}'
             )
 
-    else:
-        bot.send_message(call.message.chat.id, "Лот не найден.")
+            # Планируем уведомление за 5 минут
+            if not five_min_notified and remaining_seconds > 300:
+                notification_time = datetime.now() + timedelta(seconds=remaining_seconds - 300)
+                scheduler.add_job(
+                    send_5min_notification,
+                    'date',
+                    run_date=notification_time,
+                    args=[lot_id, title],
+                    id=f'5min_{lot_id}'
+                )
 
+
+    conn.close()
     bot.answer_callback_query(call.id)
+
 
 def update_timer(chat_id, msg_id, lot_id):
     conn = sqlite3.connect('auction.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT start_time, end_time FROM lots WHERE id = ?', (lot_id,))
-    start_time, duration = cursor.fetchone()
-    conn.close()
+    cursor.execute(
+        '''SELECT start_time, duration, five_min_notified 
+           FROM lots WHERE id = ?''',
+        (lot_id,))
+    start_time, duration, five_min_notified = cursor.fetchone()
 
-    time_left = get_time_left(start_time, duration)
+    time_left_str, remaining_seconds = get_time_left(start_time, duration)
 
+    # Проверка на 5 минут
+    if remaining_seconds <= 300 and not five_min_notified:
+        bot.send_message(chat_id, f"⚠️ Аукцион завершается через 5 минут! Успейте сделать ставку!")
+        cursor.execute('UPDATE lots SET five_min_notified = 1 WHERE id = ?', (lot_id,))
+        conn.commit()
 
+    # Обновление интерфейса
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton(
-        text=f"🕒 Осталось: {time_left}",
+        text=f"🕒 Осталось: {time_left_str}",
         callback_data='time_refresh'
     ))
 
@@ -421,22 +431,52 @@ def update_timer(chat_id, msg_id, lot_id):
         print(f"Ошибка обновления: {e}")
         scheduler.remove_job(f'timer_{lot_id}_{msg_id}')
 
-    if time_left < '00:05:00':
-        bot.send_message(GROUP_ID, f"У лота ID {lot_id} осталось 5 минут")
-
-    if "завершен" in time_left:
+    # Удаление задания при завершении
+    if "завершен" in time_left_str:
         scheduler.remove_job(f'timer_{lot_id}_{msg_id}')
+
+    conn.close()
+
+
+def send_5min_notification(lot_id, title):
+    bot.send_message(
+        GROUP_ID,
+        f"⚠️ Внимание! Аукцион на лот *{title}* (ID: {lot_id}) "
+        f"завершится через 5 минут! Успейте сделать ставку!",
+    )
+
+
+def send_finish_notification(lot_id, title):
+    bot.send_message(
+        GROUP_ID,
+        f"Аукцион с лотом ID {lot_id} завершился!",
+    )
+    bot.send_message(FINISH_GROUP_ID,
+                     f"Аукцион завершен!\nЛот: {title}\nID: {lot_id}")
+
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('place_bid_'))
 def handle_place_bid(call):
-    data = call.data.split('_')
-    lot_id = int(data[2])
-    min_bid = float(data[3])
+    user_id = call.from_user.id
+    # Проверка, существует ли пользователь в БД
+    conn = sqlite3.connect('auction.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+    existing_user = cursor.fetchone()
+    conn.close()
 
-    # Запрашиваем сумму ставки у пользователя
-    bot.send_message(call.message.chat.id, f"Введите сумму ставки (минимум {min_bid}):")
-    bot.register_next_step_handler(call.message, process_bid_amount, lot_id, min_bid)
+    if existing_user:
+        data = call.data.split('_')
+        lot_id = int(data[2])
+        min_bid = float(data[3])
+
+        # Запрашиваем сумму ставки у пользователя
+        bot.send_message(call.message.chat.id, f"Введите сумму ставки (минимум {min_bid}):")
+        bot.register_next_step_handler(call.message, process_bid_amount, lot_id, min_bid)
+    else:
+        bot.send_message(call.message.chat.id,
+                         "Не зарегистрированные пользователи не могут сделать ставку\nПожалуйста, используйте команду /start для регистрации.")
 
 
 def process_bid_amount(message, lot_id, min_bid):
@@ -490,8 +530,18 @@ def process_bid_amount(message, lot_id, min_bid):
 # Обработчик текстовых сообщений (если нужно)
 @bot.message_handler(func=lambda message: True)
 def echo_all(message):
-    bot.reply_to(message, "Пожалуйста, используйте команду /start для регистрации.")
+    user_id = message.from_user.id
+    conn = sqlite3.connect('auction.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+    existing_user = cursor.fetchone()
+    conn.close()
+
+    if existing_user:
+        bot.reply_to(message, "Пожалуйста, перепроверьте ввод команды")
+    else:
+        bot.reply_to(message, "Пожалуйста, используйте команду /start для регистрации.")
 
 
 if __name__ == '__main__':
-    bot.polling()
+    bot.polling(none_stop=True)
